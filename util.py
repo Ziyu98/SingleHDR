@@ -1,4 +1,6 @@
 import tensorflow as tf
+import numpy as np
+import cv2
 
 
 def get_tensor_shape(x):
@@ -121,3 +123,45 @@ def rand_quantize(
     
     return quantize(img, s)
 
+def get_roi(input_ldr, fdm_img_path, block_dim, random=False):
+    height, width, _ = input_ldr.shape
+    if random:
+        start_x = np.random.randint(0, width - block_dim)
+        start_y = np.random.randint(0, height - block_dim)
+
+        # Generate random ending points
+        end_x = start_x + block_dim
+        end_y = start_y + block_dim
+        return input_ldr[start_y:end_y, start_x:end_x, :], start_y, start_x
+    
+    img = cv2.imread(fdm_img_path, cv2.IMREAD_GRAYSCALE)
+    img_height, img_width = img.shape
+    if img_height != height:
+        assert height / img_height == width / img_width, "Mismatched LDR image and the fixation density map dimensions!"
+        factor = height / img_height
+        img = img.resize([int(factor * i) for i in img.size])
+    step_size = block_dim // 4
+
+    # Initialize the maximum sum and its position
+    max_density = 0
+    roi_top_left = (0, 0)
+
+    # Sweep over the image
+    for start_y in range(0, img.shape[0] - block_dim, step_size):
+        for start_x in range(0, img.shape[1] - block_dim, step_size):
+            # Extract the block
+            roi = img[start_y:start_y+block_dim, start_x:start_x+block_dim]
+
+            # Calculate the sum of the block
+            density  = np.sum(roi)
+            # print(start_y, start_x, block_sum)
+
+            # If this block's sum is greater than the current maximum, update the maximum
+            if density > max_density:
+                max_density = density
+                roi_top_left = (start_y, start_x)
+
+    # Draw a rectangle around the block with maximum sum
+    start_point = roi_top_left
+    end_point = (start_point[0] + block_dim, start_point[1] + block_dim)
+    return input_ldr[start_point[0]:end_point[0], start_point[1]:end_point[1], :], start_point[0], start_point[1]

@@ -8,9 +8,11 @@ from dequantization_net import Dequantization_net
 from linearization_net import Linearization_net
 import hallucination_net
 from util import apply_rf
+from util import get_roi
 import numpy as np
 import cv2
 import glob
+import re
 
 FLAGS = tf.app.flags.FLAGS
 epsilon = 0.001
@@ -23,6 +25,11 @@ parser.add_argument('--ckpt_path_lin', type=str, required=True)
 parser.add_argument('--ckpt_path_hal', type=str, required=True)
 parser.add_argument('--test_imgs', type=str, required=True)
 parser.add_argument('--output_path', type=str, required=True)
+parser.add_argument('--factor', type=float, default=1, help='The scaling factor for background regions')
+parser.add_argument('--fdm_path', type=str, help='Path to the fixation density map')
+parser.add_argument('--block_dim', type=int, default=256, help='Dimension of the region of interest')
+parser.add_argument('--patch_size', type=int, default=256, help='Low memory version for Jetson device')
+parser.add_argument('--efficient_mode', type=bool, default=False, help='Use efficient mode or baseline mode')
 ARGS = parser.parse_args()
 
 # ---
@@ -69,36 +76,64 @@ class Tester:
         return
 
     def test_it(self, path):
-        ldr_imgs = glob.glob(os.path.join(path, '*.png'))
+        ldr_imgs = glob.glob(os.path.join(path, '*.tif'))
         ldr_imgs.extend(glob.glob(os.path.join(path, '*.jpg')))
         ldr_imgs = sorted(ldr_imgs)
-        for ldr_img_path in ldr_imgs:
+        if ARGS.efficient_mode and ARGS.fdm_path:
+            fd_maps = glob.glob(os.path.join(ARGS.fdm_path, '*.tif'))
+            fd_maps = sorted(fd_maps)
+        
+        for index, ldr_img_path in enumerate(ldr_imgs):
             print(ldr_img_path)
             ldr_img = cv2.imread(ldr_img_path)
 
             ldr_val = np.flip(ldr_img, -1).astype(np.float32) / 255.0
+            
+            if ARGS.efficient_mode:
+                if ARGS.fdm_path:
+                    fd_map = fd_maps[index]
+                    ldr_index = int(re.findall(r'\d+', ldr_img_path)[0])
+                    fp_index = int(re.findall(r'\d+', fd_map)[0])
+                    assert ldr_index == fp_index, "LDR index does not match the fixation density map index!"
+                    roi, start_y, start_x = get_roi(ldr_val, fd_map, ARGS.block_dim)
+                else:
+                    roi, start_y, start_x = get_roi(ldr_val, '', ARGS.block_dim, True)
 
             ORIGINAL_H = ldr_val.shape[0]
             ORIGINAL_W = ldr_val.shape[1]
 
+            RESIZED_H = ORIGINAL_H
+            RESIZED_W = ORIGINAL_W
+            if ARGS.efficient_mode:
+                RESIZED_H = int(ORIGINAL_H * ARGS.factor)
+                RESIZED_W = int(ORIGINAL_W * ARGS.factor)
+            
             """resize to 64x"""
-            if ORIGINAL_H % 64 != 0 or ORIGINAL_W % 64 != 0:
-                RESIZED_H = int(np.ceil(float(ORIGINAL_H) / 64.0)) * 64
-                RESIZED_W = int(np.ceil(float(ORIGINAL_W) / 64.0)) * 64
+            if RESIZED_H % 64 != 0 or RESIZED_W % 64 != 0:
+                RESIZED_H = int(np.ceil(float(RESIZED_H) / 64.0)) * 64
+                RESIZED_W = int(np.ceil(float(RESIZED_W) / 64.0)) * 64
+            if RESIZED_H != ORIGINAL_H or RESIZED_W != ORIGINAL_W:
                 ldr_val = cv2.resize(ldr_val, dsize=(RESIZED_W, RESIZED_H), interpolation=cv2.INTER_CUBIC)
 
-            padding = 32
-            ldr_val = np.pad(ldr_val, ((padding, padding), (padding, padding), (0, 0)), 'symmetric')
+            # padding = 32
+            # ldr_val = np.pad(ldr_val, ((padding, padding), (padding, padding), (0, 0)), 'symmetric')
 
             HDR_out_val = sess.run(HDR_out, {
                 ldr: [ldr_val],
                 is_training: False,
             })
-
             HDR_out_val = np.flip(HDR_out_val[0], -1)
-            HDR_out_val = HDR_out_val[padding:-padding, padding:-padding]
-            if ORIGINAL_H % 64 != 0 or ORIGINAL_W % 64 != 0:
+            # HDR_out_val = HDR_out_val[padding:-padding, padding:-padding]
+            if RESIZED_H != ORIGINAL_H or RESIZED_W != ORIGINAL_W:
                 HDR_out_val = cv2.resize(HDR_out_val, dsize=(ORIGINAL_W, ORIGINAL_H), interpolation=cv2.INTER_CUBIC)
+                
+            if ARGS.efficient_mode:
+                HDR_out_roi = sess.run(HDR_out, {
+                    ldr: [roi],
+                    is_training: False,
+                })
+                HDR_out_roi = np.flip(HDR_out_roi[0], -1)
+                HDR_out_val[start_y:start_y+ARGS.block_dim, start_x:start_x+ARGS.block_dim, :] = HDR_out_roi
             cv2.imwrite(os.path.join(ARGS.output_path, os.path.split(ldr_img_path)[-1][:-3]+'hdr'), HDR_out_val)
 
 
